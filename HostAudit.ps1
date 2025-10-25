@@ -1,220 +1,207 @@
-<# 
+<#
 .SYNOPSIS
-  Host integrity + kernel/filters audit (SFC, DISM, Defender, Sysmon, fltmc, driver signatures, hashes)
-  Default output path: T:\GNO-JUNGLE\Jaguar\Reports\HostAudit
-  After each run, automatically opens the run folder in Explorer (can disable with -NoExplorer).
+  Host-Audit.ps1 — Windows host integrity & filter/driver audit (GitHub-safe).
 
-.EXAMPLE
+.DESCRIPTION
+  Read-only audit that collects:
+    • DISM /CheckHealth (and optional SFC /scannow)
+    • Defender status snapshot (if module available)
+    • Mini-filter stack (fltmc) → CSV + raw txt
+    • Running kernel drivers with signer + SHA256
+    • Non-Microsoft driver subset
+    • Sysmon service presence/state and version (best-effort)
+
+  Outputs a timestamped folder under a configurable root. No environment-specific
+  paths are embedded. The script self-elevates if needed and (by default) opens
+  the results folder in Explorer when finished.
+
+  Output root resolution (in order):
+    1) -OutputRoot parameter
+    2) $env:HOSTAUDIT_ROOT
+    3) "$HOME\Reports\HostAudit"
+
+.PARAMETER Quick
+  Skip SFC /scannow (faster run).
+
+.PARAMETER NoExplorer
+  Do not auto-open Explorer on completion.
+
+.PARAMETER OutputRoot
+  Explicit output root (overrides HOSTAUDIT_ROOT).
+
+.NOTES
+  • Requires PowerShell 7+ and administrative rights (auto-elevates).
+  • Repository-safe: does not disclose private mount points.
+  • All actions are read-only.
+
+.EXAMPLES
   pwsh -File .\Host-Audit.ps1
   pwsh -File .\Host-Audit.ps1 -Quick
-  pwsh -File .\Host-Audit.ps1 -NoExplorer
+  pwsh -File .\Host-Audit.ps1 -OutputRoot 'D:\Forensics\HostAudits' -NoExplorer
 #>
 
+[CmdletBinding()]
 param(
   [switch]$Quick,
-  [switch]$NoExplorer
+  [switch]$NoExplorer,
+  [string]$OutputRoot
 )
 
 # ----------------------------- Elevation -----------------------------
-function Assert-Admin {
+function Ensure-Admin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
-  $p  = New-Object Security.Principal.WindowsPrincipal($id)
+  $p  = [Security.Principal.WindowsPrincipal]::new($id)
   if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     Write-Host "[+] Elevation required. Relaunching ..." -ForegroundColor Yellow
-    $pwshExe = Join-Path $PSHOME 'pwsh.exe'   # ensure we spawn the EXE, not pwsh.dll
+    $pwshExe = Join-Path $PSHOME 'pwsh.exe'
     $args = @('-NoLogo','-File',$PSCommandPath)
-    if ($Quick)     { $args += '-Quick' }
-    if ($NoExplorer){ $args += '-NoExplorer' }
+    if ($Quick) { $args += '-Quick' }
+    if ($NoExplorer) { $args += '-NoExplorer' }
+    if ($OutputRoot) { $args += @('-OutputRoot', $OutputRoot) }
     Start-Process -FilePath $pwshExe -ArgumentList $args -Verb RunAs | Out-Null
     exit
   }
 }
-Assert-Admin
+Ensure-Admin
 
-# ----------------------------- Paths -----------------------------
-$DefaultRoot = 'T:\GNO-JUNGLE\Jaguar\Reports\HostAudit'
-if (-not (Test-Path $DefaultRoot)) { New-Item -ItemType Directory -Path $DefaultRoot -Force | Out-Null }
+# ----------------------------- Output Paths -----------------------------
+function Resolve-OutputRoot {
+  param([string]$Override)
+  if ($Override) { return $Override }
+  if ($env:HOSTAUDIT_ROOT) { return $env:HOSTAUDIT_ROOT }
+  return (Join-Path $HOME 'Reports\HostAudit')
+}
 
+$Root = Resolve-OutputRoot -Override $OutputRoot
+if (-not (Test-Path $Root)) { New-Item -ItemType Directory -Path $Root -Force | Out-Null }
 $HostName = $env:COMPUTERNAME
 $Stamp    = Get-Date -Format 'yyyy-MM-dd_HH-mm-ss'
-$OutDir   = Join-Path $DefaultRoot ("{0}_{1}" -f $HostName,$Stamp)
+$OutDir   = Join-Path $Root "${HostName}_${Stamp}"
 New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
 
-$TxtReport  = Join-Path $OutDir ("Summary_{0}_{1}.txt" -f $HostName,$Stamp)
-$CsvDrivers = Join-Path $OutDir ("RunningKernelDrivers_{0}_{1}.csv" -f $HostName,$Stamp)
-$CsvFilters = Join-Path $OutDir ("MiniFilters_{0}_{1}.csv" -f $HostName,$Stamp)
-$CsvIssues  = Join-Path $OutDir ("NonMicrosoftDrivers_{0}_{1}.csv" -f $HostName,$Stamp)
-$LogFile    = Join-Path $OutDir ("Transcript_{0}_{1}.log" -f $HostName,$Stamp)
+# Files
+$Summary   = Join-Path $OutDir "Summary_${HostName}_${Stamp}.txt"
+$Transcript= Join-Path $OutDir "Transcript_${HostName}_${Stamp}.log"
+$DismChk   = Join-Path $OutDir "DISM_CheckHealth_${HostName}_${Stamp}.txt"
+$SfcPath   = Join-Path $OutDir "SFC_${HostName}_${Stamp}.txt"
+$FltTxt    = Join-Path $OutDir "fltmc_${HostName}_${Stamp}.txt"
+$FltCsv    = Join-Path $OutDir "MiniFilters_${HostName}_${Stamp}.csv"
+$DrvCsv    = Join-Path $OutDir "RunningKernelDrivers_${HostName}_${Stamp}.csv"
+$NonMsCsv  = Join-Path $OutDir "NonMicrosoftDrivers_${HostName}_${Stamp}.csv"
 
-try { Start-Transcript -Path $LogFile -Force | Out-Null } catch {}
+# Start transcript (best-effort)
+try { Start-Transcript -Path $Transcript -Force | Out-Null } catch {}
 
-# ----------------------------- Helpers -----------------------------
-function QuickLine([string]$s){ Add-Content -Path $TxtReport -Value $s }
-function Normalize-DriverPath([string]$raw) {
+function Write-Sum([string]$s){ Add-Content -Path $Summary -Value $s }
+Add-Content -Path $Summary -Value "Host-Audit run: $((Get-Date).ToString('u'))"
+Add-Content -Path $Summary -Value "Host: $HostName"
+Add-Content -Path $Summary -Value "OutDir: $OutDir`n"
+
+# ----------------------------- Health Checks -----------------------------
+Write-Host "[DISM] /CheckHealth..." -ForegroundColor Cyan
+$dout = cmd.exe /c 'dism /online /cleanup-image /checkhealth'
+$dout | Out-File -FilePath $DismChk -Encoding UTF8
+Add-Content -Path $Summary -Value "== DISM CheckHealth =="
+Add-Content -Path $Summary -Value ($dout -join "`n")
+
+$chk = ($dout -join "`n")
+$needsRepair = ($chk -match 'The component store is repairable' -or $chk -match 'The component store is corrupted')
+if ($needsRepair) {
+  Write-Host "[DISM] Component store repairable or corrupted -> consider /RestoreHealth" -ForegroundColor Yellow
+} else {
+  Write-Host "[DISM] No repair needed." -ForegroundColor Green
+}
+
+if (-not $Quick) {
+  Write-Host "[SFC] sfc /scannow..." -ForegroundColor Cyan
+  $s = cmd.exe /c 'sfc /scannow'
+  $s | Out-File -FilePath $SfcPath -Encoding UTF8
+  Add-Content -Path $Summary -Value "\n== SFC /scannow =="
+  Add-Content -Path $Summary -Value ($s -join "`n")
+} else {
+  Add-Content -Path $Summary -Value "(Quick mode: SFC skipped)"
+}
+
+# Defender status
+Write-Host "[Defender] Snapshot..." -ForegroundColor Cyan
+try {
+  if (Get-Command Get-MpComputerStatus -ErrorAction SilentlyContinue) {
+    $mp = Get-MpComputerStatus
+    Add-Content -Path $Summary -Value ("`n== Defender ==`nAMServiceEnabled={0} RealTime={1} Antispyware={2}" -f $mp.AMServiceEnabled,$mp.RealTimeProtectionEnabled,$mp.AntispywareEnabled)
+  } else { Add-Content -Path $Summary -Value "Defender cmdlets not available." }
+} catch { Add-Content -Path $Summary -Value "Defender snapshot failed: $($_.Exception.Message)" }
+
+# Sysmon status (best-effort)
+Write-Host "[Sysmon] Status..." -ForegroundColor Cyan
+try {
+  $sysmonSvc = Get-Service -Name 'Sysmon*' -ErrorAction SilentlyContinue | Select-Object -First 1
+  if ($sysmonSvc) {
+    $state = $sysmonSvc.Status
+    $ver = (Get-ItemProperty -Path 'HKLM:SOFTWARE\\Microsoft\\Sysmon' -Name 'ProductVersion' -ErrorAction SilentlyContinue).ProductVersion
+    Add-Content -Path $Summary -Value ("Sysmon: Service={0}  Status={1}  Version={2}" -f $sysmonSvc.Name,$state,($ver? $ver : 'Unknown'))
+  } else {
+    Add-Content -Path $Summary -Value "Sysmon: not installed."
+  }
+} catch { Add-Content -Path $Summary -Value "Sysmon check failed: $($_.Exception.Message)" }
+
+# ----------------------------- Mini-filters -----------------------------
+Write-Host "[Filters] fltmc list..." -ForegroundColor Cyan
+try {
+  $fltmc = & fltmc
+  $fltmc | Out-File -FilePath $FltTxt -Encoding UTF8
+  # Parse basic table lines into CSV (Filter Name, Num Instances, Altitude, Frame)
+  $rows = @()
+  foreach ($line in $fltmc) {
+    if ($line -match '^-+$' -or $line -match 'Filter Name') { continue }
+    $parts = ($line -replace '\s{2,}', '|').Trim('|').Split('|')
+    if ($parts.Count -ge 4) {
+      $rows += [pscustomobject]@{ FilterName=$parts[0].Trim(); NumInstances=$parts[1].Trim(); Altitude=$parts[2].Trim(); Frame=$parts[3].Trim() }
+    }
+  }
+  $rows | Export-Csv -Path $FltCsv -NoTypeInformation -Encoding UTF8
+} catch {
+  Add-Content -Path $Summary -Value "fltmc failed (are you admin?): $($_.Exception.Message)"
+}
+
+# ----------------------------- Drivers -----------------------------
+Write-Host "[Drivers] Enumerating with signatures + SHA256..." -ForegroundColor Cyan
+function Normalize-Path([string]$raw){
   if (-not $raw) { return $null }
   $p = $raw.Trim('"')
-  if ($p -match '(?i)\.sys') {
-    $idx = $p.ToLower().LastIndexOf('.sys')
-    if ($idx -ge 0) { $p = $p.Substring(0, $idx + 4) }
-  }
   $p = $p -replace '^(\\\\\?\\)',''
-  $p = $p -replace '^(?i)\\SystemRoot', $env:SystemRoot
+  $p = $p -replace '^(?i)\\SystemRoot', "$env:SystemRoot"
   if ($p -match '^(?i)\\Windows\\') { $p = "$($env:SystemDrive)$p" }
   return $p
 }
-function Try-GetSignature($path) { try { if (Test-Path $path) { Get-AuthenticodeSignature -FilePath $path } } catch {} }
-function Coalesce($a,$b){ if ($null -ne $a -and "$a" -ne '') { $a } else { $b } }
-function Tick($msg){ Write-Host $msg -ForegroundColor Cyan }
 
-# ----------------------------- System snapshot -----------------------------
-Tick '[Info] System snapshot...'
-try { $os   = Get-CimInstance Win32_OperatingSystem } catch {}
-try { $cs   = Get-CimInstance Win32_ComputerSystem } catch {}
-try { $bios = Get-CimInstance Win32_BIOS } catch {}
-try { $sb   = Confirm-SecureBootUEFI -ErrorAction Stop } catch { $sb = 'Unknown/Legacy or blocked' }
-try { $tpm  = Get-Tpm } catch {}
-
-QuickLine "=== Host Audit: $HostName  @ $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') ==="
-QuickLine ("OS          : {0} {1} (Build {2})" -f $os.Caption,$os.Version,[System.Environment]::OSVersion.Version.Build)
-QuickLine ("Edition     : {0}" -f [System.Environment]::OSVersion.VersionString)
-QuickLine ("Machine     : {0} {1}" -f $cs.Manufacturer,$cs.Model)
-QuickLine ("BIOS/UEFI   : {0}  (Date: {1})" -f $bios.SMBIOSBIOSVersion,$bios.ReleaseDate)
-QuickLine ("Secure Boot : {0}" -f $sb)
-if ($tpm) { QuickLine ("TPM         : Present={0} Ready={1} Version={2}" -f $tpm.TpmPresent,$tpm.TpmReady,$tpm.ManufacturerVersion) }
-QuickLine ''
-
-# ----------------------------- Health checks -----------------------------
-if (-not $Quick) {
-  Tick '[SFC] Running...'
-  QuickLine '== SFC /scannow =='
-  $sfcOut = cmd.exe /c 'sfc /scannow'
-  $sfcPath = Join-Path $OutDir ("SFC_{0}_{1}.txt" -f $HostName,$Stamp)
-  $sfcOut | Out-File -FilePath $sfcPath -Encoding UTF8
-  $sfcSummary = ($sfcOut | Select-String -Pattern 'Windows Resource Protection.*' | Select-Object -First 1).Line
-  QuickLine (Coalesce $sfcSummary "SFC completed. See: $sfcPath")
-  QuickLine ''
-} else { QuickLine '== SFC skipped (Quick mode) =='; QuickLine '' }
-
-Tick '[DISM] CheckHealth...'
-QuickLine '== DISM /Online /Cleanup-Image /CheckHealth =='
-$dismOut = cmd.exe /c 'dism /online /cleanup-image /checkhealth'
-$dismPath = Join-Path $OutDir ("DISM_CheckHealth_{0}_{1}.txt" -f $HostName,$Stamp)
-$dismOut | Out-File -FilePath $dismPath -Encoding UTF8
-$dismSummary = ($dismOut | Select-String -Pattern 'No component store corruption|The component store is repairable|repair operation' | Select-Object -First 1).Line
-QuickLine (Coalesce $dismSummary "DISM completed. See: $dismPath")
-QuickLine ''
-
-# ----------------------------- Defender -----------------------------
-Tick '[Defender] Status...'
-QuickLine '== Microsoft Defender Status =='
-try {
-  $mp = Get-MpComputerStatus
-  $defLine = "AMService={0}  RTP={1}  Antispyware={2}  Engine={3}" -f $mp.AMServiceEnabled,$mp.RealTimeProtectionEnabled,$mp.AntispywareEnabled,$mp.AMEngineVersion
-  QuickLine $defLine
-} catch { QuickLine "Defender status unavailable: $($_.Exception.Message)" }
-QuickLine ''
-
-# ----------------------------- Sysmon -----------------------------
-Tick '[Sysmon] Status...'
-QuickLine '== Sysmon =='
-try {
-  $sysmonSvc = Get-Service -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '^Sysmon(64)?$' }
-  if ($sysmonSvc) {
-    $state = $sysmonSvc.Status
-    $ver = (Get-ItemProperty -Path 'HKLM:\SOFTWARE\Microsoft\Sysinternals\Sysmon' -ErrorAction SilentlyContinue).Version
-    QuickLine ("Service={0}  Status={1}  Version={2}" -f $sysmonSvc.Name,$state,(Coalesce $ver 'Unknown'))
-  } else {
-    QuickLine 'Sysmon service not found.'
+$drvRows = @()
+$nonMsRows = @()
+$drivers = Get-CimInstance Win32_SystemDriver | Where-Object { $_.PathName -match '\\.sys' }
+foreach ($d in $drivers) {
+  $path = Normalize-Path $d.PathName
+  $hash = $null
+  if ($path -and (Test-Path $path)) { try { $hash = (Get-FileHash -Algorithm SHA256 -Path $path).Hash } catch {} }
+  $sig = $null; try { if ($path) { $sig = Get-AuthenticodeSignature -FilePath $path } } catch {}
+  $pub = if ($sig -and $sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { $null }
+  $row = [pscustomobject]@{
+    Name=$d.Name; DisplayName=$d.DisplayName; State=$d.State; StartMode=$d.StartMode; Path=$path;
+    SHA256=$hash; SignatureStatus = $(if ($sig) { $sig.Status } else { 'NoSignature' }); Publisher=$pub
   }
-} catch { QuickLine "Sysmon check failed: $($_.Exception.Message)" }
-QuickLine ''
-
-# ----------------------------- Mini-filters -----------------------------
-Tick '[fltmc] Enumerating mini-filters...'
-QuickLine '== Mini-Filter Drivers (fltmc) =='
-try {
-  $flt = fltmc
-  $fltText = Join-Path $OutDir ("fltmc_{0}_{1}.txt" -f $HostName,$Stamp)
-  $flt | Out-File -FilePath $fltText -Encoding UTF8
-
-  $fltObjs = @()
-  foreach ($line in $flt) {
-    if ($line -match '^\s*-{5,}') { continue }
-    if ($line -match '^(Filter Name)') { continue }
-    if ($line.Trim() -eq '') { continue }
-    if ($line -match '^\S') {
-      $parts = ($line -replace '\s{2,}', '|').Split('|')
-      if ($parts.Count -ge 4) {
-        $fltObjs += [pscustomobject]@{
-          FilterName    = $parts[0].Trim()
-          NumInstances  = $parts[1].Trim()
-          Altitude      = $parts[2].Trim()
-          Frame         = $parts[3].Trim()
-        }
-      }
-    }
-  }
-  $fltObjs | Export-Csv -Path $CsvFilters -NoTypeInformation -Encoding UTF8
-  QuickLine ("Saved mini-filter table to: {0}" -f $CsvFilters)
-} catch {
-  QuickLine "fltmc failed: $($_.Exception.Message)"
+  $drvRows += $row
+  if ($row.Publisher -and $row.Publisher -notmatch 'Microsoft' -or $row.SignatureStatus -ne 'Valid') { $nonMsRows += $row }
 }
-QuickLine ''
+$drvRows   | Export-Csv -Path $DrvCsv  -NoTypeInformation -Encoding UTF8
+$nonMsRows | Export-Csv -Path $NonMsCsv -NoTypeInformation -Encoding UTF8
 
-# ----------------------------- Running kernel drivers -----------------------------
-Tick '[Drivers] Inventory + signatures...'
-QuickLine '== Running Kernel Drivers (*.sys) — Signatures & Hashes =='
-try {
-  $drivers = Get-CimInstance Win32_SystemDriver | Where-Object { $_.State -eq 'Running' -and $_.PathName -match '\.sys' }
-} catch {
-  $drivers = Get-WmiObject Win32_SystemDriver | Where-Object { $_.State -eq 'Running' -and $_.PathName -match '\.sys' }
-}
+# ----------------------------- Finish -----------------------------
+Add-Content -Path $Summary -Value "\nArtifacts:"
+Add-Content -Path $Summary -Value "  - $DismChk"
+if (-not $Quick) { Add-Content -Path $Summary -Value "  - $SfcPath" }
+Add-Content -Path $Summary -Value "  - $FltTxt"
+Add-Content -Path $Summary -Value "  - $FltCsv"
+Add-Content -Path $Summary -Value "  - $DrvCsv"
+Add-Content -Path $Summary -Value "  - $NonMsCsv"
 
-$rows = foreach ($d in $drivers) {
-  $path = Normalize-DriverPath $d.PathName
-  $sig = $null; $hash = $null
-  if ($path -and (Test-Path $path)) {
-    $sig  = Try-GetSignature $path
-    try { $hash = Get-FileHash -Algorithm SHA256 -Path $path } catch {}
-  }
-
-  [pscustomobject]@{
-    ServiceName     = $d.Name
-    DisplayName     = $d.DisplayName
-    StartMode       = $d.StartMode
-    State           = $d.State
-    Path            = $path
-    Exists          = $(if ($path) { Test-Path $path } else { $false })
-    Publisher       = $(if ($sig) { $sig.SignerCertificate.Subject } else { $null })
-    Issuer          = $(if ($sig) { $sig.SignerCertificate.Issuer } else { $null })
-    SignatureStatus = $(if ($sig) { $sig.Status } else { 'Unknown' })
-    IsOSBinary      = $(if ($sig) { $sig.IsOSBinary } else { $null })
-    HashAlgorithm   = $(if ($hash) { $hash.Algorithm } else { $null })
-    SHA256          = $(if ($hash) { $hash.Hash } else { $null })
-  }
-}
-
-$rows | Sort-Object ServiceName | Export-Csv -Path $CsvDrivers -NoTypeInformation -Encoding UTF8
-$nonMs = $rows | Where-Object { $_.Publisher -and ($_.Publisher -notmatch 'CN=Microsoft|O=Microsoft') }
-$nonMs | Sort-Object Publisher,ServiceName | Export-Csv -Path $CsvIssues -NoTypeInformation -Encoding UTF8
-QuickLine ("Saved running driver inventory to: {0}" -f $CsvDrivers)
-QuickLine ("Saved non-Microsoft driver list to: {0}" -f $CsvIssues)
-QuickLine ''
-
-# ----------------------------- Summary -----------------------------
-QuickLine '== Summary =='
-QuickLine ("Drivers running: {0}" -f ($rows.Count))
-QuickLine ("Non-Microsoft drivers: {0}" -f ($nonMs.Count))
-QuickLine ("Output folder: {0}" -f $OutDir)
-
+Write-Host "`n[+] Host-Audit complete. Reports saved to:`n$OutDir" -ForegroundColor Green
 try { Stop-Transcript | Out-Null } catch {}
-Write-Host "`n[+] Audit complete. Reports saved to:`n$OutDir" -ForegroundColor Green
-
-# ----------------------------- Auto-open in Explorer -----------------------------
-if (-not $NoExplorer) {
-  try { Start-Process explorer.exe $OutDir } catch { Write-Host "[!] Could not open Explorer: $($_.Exception.Message)" -ForegroundColor Yellow }
-}
-
-if ($nonMs.Count -gt 0) {
-  Write-Host ("[!] Non-Microsoft drivers detected: {0}. See:`n{1}" -f $nonMs.Count,$CsvIssues) -ForegroundColor Yellow
-}
+if (-not $NoExplorer) { try { Start-Process explorer.exe $OutDir } catch {} }
